@@ -8,13 +8,14 @@ For an agent running this on a rented GPU box. Written 2026-10-25 for Tony. Read
 
 ```
 SSH:              ssh -p <PORT> <USER>@<HOST> -i <KEY_PATH>
-GPU:              <e.g. RTX 4090 24GB>
+GPU:              RTX 4080 16GB (see the 16 GB settings in S2.2)
 HF_USER:          <your HF username or org>
 HF_RESULTS_REPO:  <HF_USER>/model-new-words-runs      (private dataset repo; agent creates it if missing)
 HF_TOKEN:         DO NOT write it in this file. Give it to the agent separately; it lives only in an env var on the box.
 CODE_REPO:        https://github.com/Tewoto1/model_new_words   (push the 5 files in "Before handoff" first)
-BUDGET:           no cap: run every tier, including Optional. Report spend as you go.
-KEEP_FULL_DELTAS: yes, for every full fine-tune run (45 runs, ~54 GB)
+BUDGET:           no cap: run every tier, including Optional. Report spend as you go. Do not leave the GPU idle.
+WEIGHT DELTAS:    none. Embedding change recorded in full for every touched row (section 6), plus hidden states.
+E_DELTA_ALL_ROWS: no          (yes = also store all 151,937 rows exactly: +14 GB fp16)
 END OF RUN:       destroy the box, after the final HF upload is verified
 ```
 
@@ -32,10 +33,10 @@ git push
 
 ## Key numbers and warnings (read before launching)
 
-- **HF upload: ~75 GB total.** 54 GB = full weight deltas of the 45 full fine-tune runs (1.2 GB each, fp16); ~17 GB = recorded hidden states; ~3 GB = everything else; +0.5 GB input data. Check your HF storage quota has room before launching.
-- **Box disk: >= 150 GB**, and a host with fast upload (>= 500 Mbit/s): 75 GB at 10 MB/s is ~2 h of paid idle GPU. Upload after every stage, delete local copies only after the upload is verified.
-- **GPU time: ~20-25 h on one RTX 4090** for all tiers + Optional (estimate; the agent re-times after a smoke test). Tier 0 ~1 h, Tier 1 ~3-4 h, Tier 2 ~4-5 h, Tier 3 ~3 h, Optional ~10 h, uploads extra.
-- **Rent a 4090.** A 5080 (16 GB) cannot run the full fine-tune stage (S2.2) as written (fp32 Adam on 0.6B needs >16 GB) and needs a PyTorch build for CUDA 12.8. A T4 is ~5x slower.
+- **HF upload: ~7 GB total.** Embedding changes ~1.9 GB (45 full fine-tune runs x ~41 MB: every row the data touches stored exactly in fp32, the other ~148k rows as a rank-64 SVD + per-row norms + the reconstruction error); hidden states ~3.2 GB; everything else ~1.3 GB; input data 0.5 GB. No weight deltas. If you want every one of the 151,937 rows exact for those 45 runs instead, that is +14 GB (fp16) or +28 GB (fp32): set `E_DELTA_ALL_ROWS: yes`.
+- **Box disk: >= 40 GB.** Upload after every stage, delete local copies only after the upload is verified.
+- **GPU time: ~20-24 h on the RTX 4080** for all tiers + Optional (estimate, ~1.5x a 4090; the agent re-times after a smoke test). Tier 0 ~1.5 h, Tier 1 ~5 h, Tier 2 ~7 h, Tier 3 ~4.5 h, Optional ~4 h, uploads extra.
+- **16 GB is enough for every stage, with S2.2 changed:** fp32 Adam on all 0.6B parameters needs >16 GB, so full fine-tune runs use 8-bit AdamW (`bitsandbytes`), gradient checkpointing and `BS=8, STEPS=600` (details in S2.2). Row-only runs fit as written in fp32.
 - **What changes in which run:** in row-only runs (most runs) the ONLY weight that changes is the new word's row of `E` (tied: it is both the input embedding and the output vector). Hidden states before the new word stay bit-identical; states at and after it change because they read the new row. In full fine-tune runs every weight changes. Section 6 records both.
 - **After the run: revoke the HF token** (the agent logs out and deletes it on the box first).
 
@@ -95,7 +96,7 @@ Known issues to handle:
    - Verify: `cd ~/model_new_words && sha256sum -c --quiet data/experiments/words_manifest.sha256` must print nothing (696 files).
    - Fallback if the Mac is unreachable: `python scripts/build_word_data.py --raw raw_tinystories --out data/words` rebuilds all 116 words from TinyStories (seeded, ~30-40 min CPU, downloads ~1 GB). Then run the sha256 check; if files differ, tell Tony before using them.
    - Record `git rev-parse HEAD`, the manifest check result, and `pip freeze` into `outputs/word_study/inputs_manifest.json`.
-3. Env: Python 3.11+, `torch` (cu12.x; cu128 on a 5080), `transformers>=4.51` (Qwen3), `safetensors`, `huggingface_hub`, `peft`, `pandas`, `matplotlib`, `scikit-learn`. Record `pip freeze` into the outputs.
+3. Env: Python 3.11+, `torch` (cu12.x), `transformers>=4.51` (Qwen3), `safetensors`, `huggingface_hub`, `peft`, `bitsandbytes`, `pandas`, `matplotlib`, `scikit-learn`. Record `pip freeze` into the outputs.
 4. HF login: `huggingface-cli login --token $HF_TOKEN` from an env var. Never write the token into a file in the repo, a log, a notebook, or the report.
 5. Download `Qwen/Qwen3-0.6B-Base` once; set `HF_HOME` to a disk with space.
 6. Run `python tests/test_core.py` (must be 16 PASS). Then a Qwen smoke test on `comp_very_big`: 20 train steps row-only, `bs=16`, check that `e_new` moves, p(NEW) on eval slots is finite, and memory use is under the GPU limit (`torch.cuda.max_memory_allocated`). Time one step and one evaluation; use those to rescale the time estimates below before committing to tiers.
@@ -153,7 +154,7 @@ Centered cosine everywhere: subtract `mu` = mean of the active rows (`make_inits
 - decomposition of the update `delta = e_final - e_init`: fraction of `||delta||^2` inside the span of the top-k principal directions (k = 16, 64, 256) of the states seen at training positions (slot states of the train rows and states at every position after NEW); fraction of the init's component outside that span that survives training;
 - functional agreement between inits: mean KL between the next-token distributions of two trained rows on eval texts (same row positions), p(NEW) at eval slots. "Different place, same function" = high KL agreement (low KL) with low cos.
 
-**S2.2 Body plasticity** (S9, N_TRAIN=200, `mean_h` init). Conditions: row-only (from S1.1), LoRA r=16 (lr 1e-4), full fine-tune with `lr_rest` in {1e-6, 1e-5, 1e-4}, and full fine-tune `lr_rest=1e-5` with `N_TRAIN=1000`. With the `use_orig` control below that is 5 full fine-tune runs per word, 45 in total. Full fine-tune in fp32 with Adam needs ~10 GB for weights + grads + optimizer state plus activations and 152k-wide logits; if `BS=16` does not fit on the GPU, use `BS=8` and `STEPS=600` (same number of examples) and record it. Also a `use_orig=True` control at `lr_rest=1e-5` (same sentences with the real phrase; tells you how much the body moves from fine-tuning alone). Per run, beyond S1.1:
+**S2.2 Body plasticity** (S9, N_TRAIN=200, `mean_h` init). Conditions: row-only (from S1.1), LoRA r=16 (lr 1e-4), full fine-tune with `lr_rest` in {1e-6, 1e-5, 1e-4}, and full fine-tune `lr_rest=1e-5` with `N_TRAIN=1000`. With the `use_orig` control below that is 5 full fine-tune runs per word, 45 in total. **16 GB settings for full fine-tune (the 4080):** fp32 weights, `bitsandbytes.optim.AdamW8bit` (weight_decay=0) in place of Adam, `m.hf.gradient_checkpointing_enable()`, `BS=8`, `STEPS=600` (same number of examples as 16 x 300). Implement it as a copy of `train()` in `experiments/word_study.py` with the optimizer swapped (keep the old-row pull-back trick exactly; it holds for any optimizer whose update is linear in lr, which AdamW8bit is). Check peak memory on the first run; record the settings. Also a `use_orig=True` control at `lr_rest=1e-5` (same sentences with the real phrase; tells you how much the body moves from fine-tuning alone). Per run, beyond S1.1:
 - **state at the slot** (the one that predicts NEW): `dh = mean_h_after - mean_h_before` over eval slots; `||dh|| / ||mean_h_before||`; centered cos(dh, e_new - mu); fraction of `||dh||^2` outside the span of the top-256 principal directions of the old active rows ("moved into a new direction");
 - **old rows**: per-row `||dE_i||` for active rows; top-20 moved rows (tokens), and their cos(dE_i, e_new - mu); do competitors / near-misses move towards or away from `e_new`?
 - **row geometry**: all Q1 metrics from S1.1, computed against the *trained* old rows;
@@ -169,7 +170,6 @@ Centered cosine everywhere: subtract `mu` = mean of the active rows (`make_inits
 
 ### Optional (run it: BUDGET has no cap)
 - Repeat S1.1 with `seed` 1 on ALL (noise floor for every metric).
-- S2.2 on the other 18 S27 words (summaries and probe states, no full deltas).
 
 ---
 
@@ -177,12 +177,17 @@ Centered cosine everywhere: subtract `mu` = mean of the active rows (`make_inits
 
 Local layout under `src/model_new_words/outputs/word_study/`, mirrored to HF `<user>/model-new-words-runs` under `word_study/`:
 
-**Probe states (the hidden-state record).** Per word, fix a probe set once and save its token ids: 64 eval rows and 64 control rows (seeded). Positions: in eval rows, the position that predicts the slot (`slot-1`), the slot itself (NEW, or the phrase's last token in the real-phrase text), and the 5 positions after it; in control rows, 4 random positions. Record **all 29 residual streams** (`output_hidden_states`: embedding output + 28 blocks; the last one is after the final norm, i.e. the `h` that projects onto `E`) at those positions, fp16. That is 704 vectors x 29 layers x 1024 = 42 MB per full set.
+**Probe states (the hidden-state record).** Per word, fix a probe set once and save its token ids: 32 eval rows and 32 control rows (seeded). Positions: in eval rows, the position that predicts the slot (`slot-1`), the slot itself (NEW, or the phrase's last token in the real-phrase text), and the 5 positions after it; in control rows, 4 random positions (352 positions). Record residual streams from `output_hidden_states` (index 0 = embedding output, 28 = after the final norm, i.e. the `h` that projects onto `E`) at those positions, fp16.
+- Layers {0, 7, 14, 21, 28} (3.6 MB per set) for base sets and row-only runs; all 29 layers (21 MB per set) for full fine-tune and LoRA runs.
 - base (once per word): real-phrase text, and NEW text with the init row.
 - after each run: row-only runs store only positions >= slot of the eval rows (the rest are provably unchanged; check it on one run per stage by recording everything and asserting equality). Full fine-tune and LoRA runs store the full set.
-- Layers: all 29 for S27 words and for every Tier 2 run; layers {0, 7, 14, 21, 28} for the other ALL-word runs and for Tier 3 data scaling.
 
-**Embedding record.** Every run: `e_init`, `e_final`, `e_traj` (every 25 steps), fp32. Full fine-tune runs additionally: the full `dE` for active rows in fp32 (ids + rows), plus the full weight delta (all tensors, fp16) since `KEEP_FULL_DELTAS = yes`.
+**Embedding record (in full).** Every run: `e_init`, `e_final`, `e_traj` (every 25 steps), fp32. In row-only and LoRA runs no other row of `E` changes (assert it, max |dE| over old rows must be exactly 0). Full fine-tune runs, `dE = E_after - E_before`:
+- exact fp32 rows for every touched id: all tokens appearing in that run's train / eval / competitor / near-miss / control rows, plus the 2,000 rows with the largest `||dE_i||` (~5-8k rows, ~25 MB);
+- every other row: rank-64 SVD of their `dE` (U fp16, S, V fp32, ~20 MB), plus `||dE_i||` for all 151,937 rows and the relative reconstruction error per row (so you know exactly what the low-rank part misses). These rows only get the output-softmax push, a sum of training hidden states, so a low-rank fit should be close; report the error;
+- if `E_DELTA_ALL_ROWS = yes`: also the full `[151937, 1024]` dE (fp16, 311 MB);
+- `E` trajectories of the 50 most-moved rows every 50 steps.
+No other weight deltas are saved; for non-embedding weights keep only per-tensor norms and top-8 SVDs.
 
 Layout under `outputs/word_study/` (code root), mirrored to HF `HF_RESULTS_REPO` under `word_study/`:
 
@@ -193,21 +198,20 @@ base/<word>/stage0.json     S0.1-S0.3 numbers
 base/<word>/probe.json      probe rows (ids) and positions
 base/<word>/probe_states_phrase.safetensors   fp16 [n_pos, n_layers, 1024], real-phrase text
 base/<word>/probe_states_init.safetensors     fp16, NEW text with e_init (mean_h)
-base/<word>/slot_states.safetensors   fp16: slot states of eval / competitor / nearmiss / control (layers 7/14/21 + h),
+base/<word>/slot_states.safetensors   fp16: slot states of eval / competitor / nearmiss / control (layer 14 + h),
                                       phrase-end states, mean_h variants (bootstrap halves, frame-controlled, short-context)
 base/ref.safetensors        once: E rows of every active id over all words (fp32) + ids; mu per word
 runs/<run_id>/config.json, metrics.json, curve.json
 runs/<run_id>/rows.safetensors          fp32: e_init, e_final, e_traj [n_logs, d]
 runs/<run_id>/probe_states_after.safetensors   fp16 (see Probe states)
-runs/<run_id>/E_delta_active.safetensors       full FT: fp32 dE for active rows + ids
+runs/<run_id>/E_delta.safetensors      full FT: exact fp32 rows for touched + top-2000 ids, rank-64 SVD of the rest, per-row ||dE_i|| and SVD error, top-50 row trajectories (~41 MB)
 runs/<run_id>/delta_summary.json        full FT / LoRA: per-tensor ||dW||, ||dW||/||W||
 runs/<run_id>/delta_svd.safetensors     full FT: top-8 U, S, V (fp16) per 2-D weight delta
-runs/<run_id>/delta_full.safetensors    full FT: every tensor's delta, fp16 (~1.2 GB)
 runs/<run_id>/lora.safetensors          LoRA: adapter weights (~20 MB)
 figures/*.png, tables/*.csv, REPORT.md
 ```
 
-Expected size: full deltas 45 x 1.2 GB = 54 GB (Optional full fine-tunes on S27, if run, keep summaries only, no full deltas); probe states ~17 GB; everything else ~3 GB. Total ~75 GB.
+Expected size: embedding changes ~1.9 GB; probe states ~3.2 GB (base 0.8, row-only runs ~1.3, full FT / LoRA 1.1); slot states, weight-norm SVDs, rows, metrics ~1.3 GB; input data 0.5 GB. Total ~7 GB (+14 GB if `E_DELTA_ALL_ROWS = yes`).
 
 Upload after every stage (`huggingface_hub.HfApi().upload_folder(..., repo_type="dataset", path_in_repo="word_study/...")`; large files go through LFS automatically), verify the files are listed on HF, then delete the local copies of large files (deltas, probe states) to keep disk free. HF is the copy the run can die without.
 
