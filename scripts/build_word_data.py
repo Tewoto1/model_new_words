@@ -63,6 +63,12 @@ WORDS = {
              "'fast and slow, happy and sad'); small data"),
 }
 
+try:                                    # 110 more words for the type sweep (2026-10-24); see scripts/word_list.py
+    from word_list import WORDS_V2
+except ImportError:
+    from scripts.word_list import WORDS_V2
+WORDS.update(WORDS_V2)
+
 POOL_CAP, EVAL_MIN, EVAL_CAP, SLOT_CAP, CONTROL_N = 5000, 200, 600, 300, 500
 N_LEFT_SENTS, N_RIGHT_SENTS = 2, 1
 SENT_END = re.compile(r"""[.!?]["']?\s+""")
