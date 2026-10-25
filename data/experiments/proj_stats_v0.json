@@ -1,0 +1,10 @@
+{
+  "name": "proj_stats_v0",
+  "description": "How much of the pre-decode vector h lies in the span of its top-k token embeddings, across ordinary text.",
+  "prompts": [
+    {"id": "p0", "summary": "plain factual sentence", "text": "The capital of France is"},
+    {"id": "p1", "summary": "concept with no single English word", "text": "The feeling of nostalgia for a place you have never been is"}
+  ],
+  "modes": ["normal", "banana"],
+  "max_new_tokens": 32
+}

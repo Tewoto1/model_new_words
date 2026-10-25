@@ -1,0 +1,6 @@
+checkpoints/
+outputs/
+raw_tinystories/
+data/*/
+!data/experiments/
+__pycache__/
